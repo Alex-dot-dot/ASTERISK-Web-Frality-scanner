@@ -40,13 +40,6 @@ def banner():
 ██║╚██╗██║██╔══╝   ██╔██╗ ██║   ██║      ██║   ██╔══╝  ██║     ██╔══██║
 ██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝      ██║   ███████╗╚██████╗██║  ██║
 ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝       ╚═╝   ╚══════╝ ╚═════╝╚═╝  ╚═╝
-
-█████╗ ███████╗████████╗███████╗██████╗ ██╗███████╗██╗   ██╗    ██████╗ █�[...]
-██╔══██╗██╔════╝╚══██╔══╝██╔════╝██╔══██╗██║██╔════╝╚██╗ ██╔╝    ██╔══[...]
-███████║███████╗   ██║   █████╗  ██████╔╝██║███████╗ ╚████╔╝     ██████╔╝███[...]
-██╔══██║╚════██║   ██║   ██╔══╝  ██╔══██╗██║╚════██║  ╚██╔╝      ██╔══██╗╚═══�[...]
-██║  ██║███████║   ██║   ███████╗██║  ██║██║███████║   ██║       ██████╔╝███████[...]
-╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝       ╚═════╝ ╚══════��[...]
 """)
 
 
@@ -105,11 +98,13 @@ SENSITIVE_FILES = [
 # ---------------------------------------------------------------- scanner core
 class WScan:
     def __init__(self, base, args):
+        # normalize base early to avoid None/TypeError and to reuse consistently
         self.base = (base or "").rstrip("/")
         self.args = args
         self.session = requests.Session()
         self.session.verify = not getattr(args, "no_verify", False)
-        self.seen, self.queue = set(), [base]
+        # use normalized base for queue to avoid None inside the crawl queue
+        self.seen, self.queue = set(), [self.base]
         self.findings = []
         self.urls_scanned = 0
 
@@ -138,12 +133,32 @@ class WScan:
             self.add(url, f"Potentially outdated server: {srv}", "medium")
 
     def check_cookies(self, r, url):
-        for c in self.session.cookies:
+        # Prefer parsing Set-Cookie headers from the response for accurate attributes
+        sc_headers = []
+        # requests may combine multiple Set-Cookie headers into a single header value
+        raw = r.headers.get('Set-Cookie')
+        if raw:
+            # try to split multiple cookies conservatively
+            sc_headers = re.split(r', (?=[^=]+=[^;]+)', raw)
+        # also check cookies stored in the session as a fallback
+        for part in sc_headers:
+            name_match = re.match(r"\s*([^=;\s]+)=", part)
+            name = name_match.group(1) if name_match else None
+            has_secure = re.search(r'(?i)\bsecure\b', part) is not None
+            has_httponly = re.search(r'(?i)\bhttponly\b', part) is not None
+            if name and (not has_secure or not has_httponly) and getattr(self.args, "cookies", False):
+                flags = []
+                if not has_secure:
+                    flags.append('missing Secure')
+                if not has_httponly:
+                    flags.append('missing HttpOnly')
+                self.add(url, f"Weak cookie '{name}'", "medium", "; ".join(flags))
+
+        # fallback: inspect cookies in session cookiejar (may lack HttpOnly info)
+        for c in getattr(self.session, 'cookies', []):
             flags = []
-            if not c.secure:
-                flags.append("missing Secure")
-            if not hasattr(c, "_rest") or "httponly" not in c._rest:
-                flags.append("missing HttpOnly")
+            if not getattr(c, 'secure', False):
+                flags.append('missing Secure')
             if flags and getattr(self.args, "cookies", False):
                 self.add(url, f"Weak cookie '{c.name}'", "medium", "; ".join(flags))
 
@@ -152,13 +167,15 @@ class WScan:
         if not r or r.status_code != 200:
             return False
         low = r.text[:4000].lower()
-        path = urlparse(url).path.split("?")[0]
+        path = urlparse(url).path.split('?')[0]
+        path_norm = path.lstrip('/').lower()
         checks = {
-            ".git/config": "[core]" in low or "repositoryformatversion" in low,
-            ".git/head": "ref:" in low,
+            ".git/config": ("[core]" in low or "repositoryformatversion" in low),
+            ".git/head": ("ref:" in low),
             ".env": bool(re.search(r"(secret|api_key|password|token)\s*=", low)),
         }
-        return bool(checks.get(path, True))
+        # Only return True on explicit match to avoid false positives
+        return bool(checks.get(path_norm, False))
 
     # ---- active tests on a single parameter
     def test_param(self, url, param, value):
@@ -201,6 +218,9 @@ class WScan:
 
     # ---- crawl one page
     def process_page(self, url):
+        # defensive: skip empty urls
+        if not url:
+            return
         self.urls_scanned += 1
         r = self.request(url)
         if not r:
@@ -236,9 +256,15 @@ class WScan:
             p.scheme in ("http", "https")
 
     def run(self):
-        self.seen.add(self.base)
+        # start with normalized base if present
+        if self.base:
+            self.seen.add(self.base)
         while self.queue and self.urls_scanned < self.args.max_urls:
-            self.process_page(self.queue.pop(0))
+            nxt = self.queue.pop(0)
+            # defensive: skip None/empty entries
+            if not nxt:
+                continue
+            self.process_page(nxt)
             time.sleep(self.args.delay)
 
         if getattr(self.args, "sensitive", False):
